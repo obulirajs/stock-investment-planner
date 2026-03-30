@@ -1,0 +1,289 @@
+# backend/etl/indicators_etl.py
+"""
+Advanced Indicators ETL (production-ready)
+
+Computes (per-day):
+ - SMA: 10,20,50,100,200
+ - EMA: 20,50
+ - RSI: 14
+ - MACD: 12,26,9 (macd, signal, hist)
+ - ATR: 14
+ - Momentum: 20,100 (percent)
+ - 52w high / low (252 trading days)
+ - Volatility: rolling stddev 20
+ - OBV (On-Balance Volume)
+ - ADX (14)
+ - Stochastic RSI (stoch RSI, %K, %D) using RSI(14)
+ - Bollinger Bands (20,2)
+ - others: close, volume
+
+Design notes:
+ - Uses pandas/numpy vectorized calculations.
+ - Reads price data from `daily_price_data` and writes indicators to `technical_indicators`.
+ - Upserts per (symbol, date).
+ - Use concurrency chunking to avoid memory / DB pressure.
+"""
+
+import asyncio
+from datetime import datetime, timedelta
+from typing import List, Optional
+import math
+
+import numpy as np
+import pandas as pd
+
+from backend.db import get_database
+
+# Tune these for your laptop
+CONCURRENCY = 4
+BATCH_SYMBOLS = 8  # number of symbols processed concurrently per chunk
+
+# ------ Indicator helpers (vectorized) ------------------------------------
+def sma(s: pd.Series, window: int) -> pd.Series:
+    return s.rolling(window=window, min_periods=1).mean()
+
+def ema(s: pd.Series, span: int) -> pd.Series:
+    return s.ewm(span=span, adjust=False).mean()
+
+def rsi(s: pd.Series, period: int = 14) -> pd.Series:
+    delta = s.diff()
+    up = delta.clip(lower=0)
+    down = -1 * delta.clip(upper=0)
+    ma_up = up.ewm(com=(period - 1), adjust=False).mean()
+    ma_down = down.ewm(com=(period - 1), adjust=False).mean()
+    rs = ma_up / ma_down.replace(0, np.nan)
+    rsi = 100 - (100 / (1 + rs))
+    return rsi.fillna(50)
+
+def macd(s: pd.Series, short=12, long=26, signal=9):
+    e_short = s.ewm(span=short, adjust=False).mean()
+    e_long = s.ewm(span=long, adjust=False).mean()
+    macd_line = e_short - e_long
+    macd_signal = macd_line.ewm(span=signal, adjust=False).mean()
+    macd_hist = macd_line - macd_signal
+    return macd_line, macd_signal, macd_hist
+
+def atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    high = df['high']
+    low = df['low']
+    close = df['close']
+    prev_close = close.shift(1)
+    tr1 = high - low
+    tr2 = (high - prev_close).abs()
+    tr3 = (low - prev_close).abs()
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    return tr.ewm(span=period, adjust=False).mean()
+
+def momentum_pct(s: pd.Series, window: int) -> pd.Series:
+    return s.pct_change(periods=window) * 100.0
+
+def bollinger(s: pd.Series, window: int = 20, num_std: int = 2):
+    mid = s.rolling(window=window, min_periods=1).mean()
+    std = s.rolling(window=window, min_periods=1).std().fillna(0)
+    upper = mid + num_std * std
+    lower = mid - num_std * std
+    return upper, mid, lower
+
+def volatility_std(s: pd.Series, window: int = 20) -> pd.Series:
+    return s.pct_change().rolling(window=window, min_periods=1).std() * np.sqrt(252)  # annualized approx
+
+def obv(close: pd.Series, volume: pd.Series) -> pd.Series:
+    # On-balance volume
+    direction = np.sign(close.diff()).fillna(0)
+    return (direction * volume).cumsum().fillna(0)
+
+# ADX helper (classic)
+def adx(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    high = df['high']
+    low = df['low']
+    close = df['close']
+    # True Ranges
+    prev_high = high.shift(1)
+    prev_low = low.shift(1)
+    prev_close = close.shift(1)
+
+    tr = pd.concat([
+        high - low,
+        (high - prev_close).abs(),
+        (low - prev_close).abs()
+    ], axis=1).max(axis=1)
+
+    # directional movement
+    up_move = high - prev_high
+    down_move = prev_low - low
+
+    plus_dm = up_move.where((up_move > down_move) & (up_move > 0), 0.0)
+    minus_dm = down_move.where((down_move > up_move) & (down_move > 0), 0.0)
+
+    # smoothed averages using Wilder's EMA (same as ewm with alpha=1/period)
+    tr_s = tr.ewm(alpha=1/period, adjust=False).mean()
+    plus_s = plus_dm.ewm(alpha=1/period, adjust=False).mean()
+    minus_s = minus_dm.ewm(alpha=1/period, adjust=False).mean()
+
+    plus_di = 100 * (plus_s / tr_s)
+    minus_di = 100 * (minus_s / tr_s)
+    dx = (abs(plus_di - minus_di) / (plus_di + minus_di)).replace([np.inf, -np.inf], 0).fillna(0) * 100
+    adx_val = dx.ewm(alpha=1/period, adjust=False).mean()
+    return adx_val.fillna(0)
+
+# Stochastic RSI (K, D)
+def stoch_rsi(rsi_series: pd.Series, k_window: int = 14, d_window: int = 3):
+    min_rsi = rsi_series.rolling(window=k_window, min_periods=1).min()
+    max_rsi = rsi_series.rolling(window=k_window, min_periods=1).max()
+    stoch = (rsi_series - min_rsi) / (max_rsi - min_rsi)
+    k = stoch * 100
+    d = k.rolling(window=d_window, min_periods=1).mean()
+    return k.fillna(50), d.fillna(50)
+
+
+# ----------------- DB helpers ------------------------------------------------
+async def get_all_symbols() -> List[str]:
+    db = get_database()
+    coll = db["stocks_master"]
+    symbols = [d["symbol"] async for d in coll.find({}, {"symbol": 1})]
+    return symbols
+
+async def fetch_price_df(symbol: str) -> pd.DataFrame:
+    """
+    Return dataframe indexed by UTC date with columns: open, high, low, close, volume
+    """
+    db = get_database()
+    coll = db["daily_price_data"]
+    cursor = coll.find({"symbol": symbol}).sort("date", 1)
+    rows = [r async for r in cursor]
+    if not rows:
+        return pd.DataFrame()
+    df = pd.DataFrame(rows)
+    # Ensure date is datetime with UTC
+    df['date'] = pd.to_datetime(df['date'], utc=True)
+    df = df.set_index('date').sort_index()
+    for col in ['open', 'high', 'low', 'close', 'volume']:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+        else:
+            df[col] = np.nan
+    # drop rows with no close
+    df = df[df['close'].notna()]
+    return df[['open', 'high', 'low', 'close', 'volume']]
+
+async def upsert_indicators(symbol: str, ind_df: pd.DataFrame):
+    db = get_database()
+    coll = db["technical_indicators"]
+    # iterate and upsert
+    for idx, row in ind_df.iterrows():
+        # build doc
+        date_dt = idx.to_pydatetime()
+        indicators = {}
+        for col in ind_df.columns:
+            val = row[col]
+            if pd.isna(val):
+                continue
+            # ensure JSON serializable primitives
+            try:
+                indicators[col] = float(val)
+            except Exception:
+                indicators[col] = val
+        doc = {"symbol": symbol, "date": date_dt, "indicators": indicators}
+        await coll.update_one({"symbol": symbol, "date": date_dt}, {"$set": doc}, upsert=True)
+
+# ----------------- Compute indicators for one symbol -------------------------
+async def compute_indicators_for_symbol(symbol: str) -> bool:
+    df = await fetch_price_df(symbol)
+    if df.empty or len(df) < 30:
+        print(f"⚠ Not enough data for {symbol}; skipping.")
+        return False
+
+    close = df['close'].copy()
+    high = df['high'].copy()
+    low = df['low'].copy()
+    volume = df['volume'].copy()
+
+    ind = pd.DataFrame(index=df.index)
+
+    # Moving averages
+    ind['sma10'] = sma(close, 10)
+    ind['sma20'] = sma(close, 20)
+    ind['sma50'] = sma(close, 50)
+    ind['sma100'] = sma(close, 100)
+    ind['sma200'] = sma(close, 200)
+
+    # EMAs
+    ind['ema20'] = ema(close, 20)
+    ind['ema50'] = ema(close, 50)
+
+    # RSI & StochRSI
+    ind['rsi14'] = rsi(close, 14)
+    stoch_k, stoch_d = stoch_rsi(ind['rsi14'], k_window=14, d_window=3)
+    ind['stoch_rsi_k'] = stoch_k
+    ind['stoch_rsi_d'] = stoch_d
+
+    # MACD
+    macd_line, macd_signal, macd_hist = macd(close)
+    ind['macd'] = macd_line
+    ind['macd_signal'] = macd_signal
+    ind['macd_hist'] = macd_hist
+
+    # ATR
+    ind['atr14'] = atr(df, 14)
+
+    # Momentum
+    ind['momentum20'] = momentum_pct(close, 20)
+    ind['momentum100'] = momentum_pct(close, 100)
+
+    # Bollinger Bands
+    bb_upper, bb_mid, bb_lower = bollinger(close, 20, 2)
+    ind['bb_upper'] = bb_upper
+    ind['bb_mid'] = bb_mid
+    ind['bb_lower'] = bb_lower
+
+    # 52-week High/Low (252 trading days)
+    ind['52w_high'] = close.rolling(window=252, min_periods=1).max()
+    ind['52w_low'] = close.rolling(window=252, min_periods=1).min()
+
+    # Volatility (annualized std)
+    ind['volatility_20'] = volatility_std(close, 20)
+
+    # OBV
+    ind['obv'] = obv(close, volume)
+
+    # ADX (14)
+    ind['adx14'] = adx(df, 14)
+
+    # Keep reference columns
+    ind['close'] = close
+    ind['volume'] = volume
+
+    # Persist
+    await upsert_indicators(symbol, ind)
+    print(f"✔ Indicators computed for {symbol} ({len(ind)} rows).")
+    return True
+
+# ----------------- Orchestrator --------------------------------------------
+async def run_indicators_etl(symbols: Optional[List[str]] = None):
+    if symbols is None:
+        symbols = await get_all_symbols()
+    sem = asyncio.Semaphore(CONCURRENCY)
+
+    async def worker(sym):
+        async with sem:
+            try:
+                return await compute_indicators_for_symbol(sym)
+            except Exception as e:
+                print(f"❌ Error computing {sym}: {e}")
+                return False
+
+    results = []
+    # process in chunks to limit memory and DB pressure
+    for i in range(0, len(symbols), BATCH_SYMBOLS):
+        chunk = symbols[i:i + BATCH_SYMBOLS]
+        tasks = [asyncio.create_task(worker(s)) for s in chunk]
+        res = await asyncio.gather(*tasks)
+        results.extend(res)
+        await asyncio.sleep(0.3)
+
+    succeeded = sum(1 for r in results if r)
+    failed = len(results) - succeeded
+    print(f"\nDone. succeeded={succeeded}, failed={failed}")
+
+if __name__ == "__main__":
+    asyncio.run(run_indicators_etl())

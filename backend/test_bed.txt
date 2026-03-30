@@ -1,0 +1,29 @@
+mkdir -p etl/stock_master
+mkdir -p etl/daily_price
+mkdir -p etl/fundamentals
+mkdir -p etl/news
+mkdir -p etl/llm_analysis
+
+type nul > etl/stock_master/fetch_symbols.py
+type nul > etl/stock_master/process_symbols.py
+
+type nul > etl/daily_price/fetch_prices.py
+type nul > etl/daily_price/process_prices.py
+
+type nul > etl/fundamentals/fetch_fundamentals.py
+type nul > etl/fundamentals/process_fundamentals.py
+
+type nul > etl/news/fetch_news.py
+type nul > etl/news/analyze_sentiment.py
+
+type nul > etl/llm_analysis/run_llm_analysis.py
+
+
+$env:PYTHONPATH = 'C:\Raj\Stock_Investment_Planner\projects'
+python etl\stock_master\fetch_symbols.py
+
+# Batch 0 (first ~250)
+python -m etl.stock_master.fetch_symbols --batch-size 250 --batch-index 0
+
+# After the FMP daily limit resets (or next day), run:
+python -m etl.stock_master.fetch_symbols --batch-size 250 --batch-index 1

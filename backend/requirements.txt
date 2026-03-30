@@ -1,0 +1,12 @@
+aiohttp
+motor
+beautifulsoup4
+lxml
+tenacity
+requests
+yfinance
+pandas
+numpy
+pymongo
+uvicorn
+fastapi

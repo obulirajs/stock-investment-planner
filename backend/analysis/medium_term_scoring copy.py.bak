@@ -1,0 +1,189 @@
+# medium_term_scoring.py
+# Pure scoring logic: accepts two indicator documents (latest, previous)
+# and returns a score object. No DB I/O here.
+
+from typing import Optional, Dict, Any
+import math
+
+# Constants for weighting (same as earlier design)
+WEIGHTS = {
+    "trend": 0.30,
+    "momentum": 0.20,
+    "volume": 0.15,
+    "volatility": 0.15,
+    "relative_strength": 0.10,
+    "fundamental": 0.10,
+}
+
+# Fallback values when previous doc is missing
+DEFAULT_PREV_SMA_SLOPE = 0.0  # neutral slope
+DEFAULT_PREV_RSI = None
+DEFAULT_PREV_VOLUME = None
+
+def _safe_get(doc: Optional[Dict[str, Any]], key: str, default=None):
+    if not doc:
+        return default
+    return doc.get(key, default)
+
+def score_trend(latest: Dict[str, Any], previous: Optional[Dict[str, Any]]) -> float:
+    """Trend score 0-100 using ADX, price vs MAs, sma slopes"""
+    adx = _safe_get(latest, "adx", 0.0)
+    price = _safe_get(latest, "close", _safe_get(latest, "adj_close", 0.0))
+    sma50 = _safe_get(latest, "sma50", None)
+    sma200 = _safe_get(latest, "sma200", None)
+
+    prev_sma50 = _safe_get(previous, "sma50", None)
+    prev_sma200 = _safe_get(previous, "sma200", None)
+
+    # compute simple slope proxy if both prev and latest exists
+    slope_score = 0.0
+    if sma50 is not None and prev_sma50 is not None:
+        slope = (sma50 - prev_sma50) / (prev_sma50 + 1e-9)
+        slope_score += max(min(slope * 100, 50), -50)  # scale
+    if sma200 is not None and prev_sma200 is not None:
+        slope = (sma200 - prev_sma200) / (prev_sma200 + 1e-9)
+        slope_score += max(min(slope * 100, 50), -50)
+
+    # Price vs MA proximity boost
+    ma_boost = 0.0
+    if sma50 and sma200:
+        if price > sma50 and price > sma200:
+            ma_boost = 20
+        elif price > sma50:
+            ma_boost = 10
+        elif price < sma50 and price < sma200:
+            ma_boost = -10
+
+    # ADX contribution (0-30 scale)
+    if adx >= 25:
+        adx_score = 30
+    elif adx >= 20:
+        adx_score = 18
+    else:
+        adx_score = 6
+
+    # Normalize slope_score roughly to 0-40
+    slope_norm = max(min((slope_score + 50) / 100 * 40, 40), 0)
+
+    raw = adx_score + slope_norm + ma_boost
+    # map into 0-100
+    return max(0.0, min(100.0, raw))
+
+def score_momentum(latest: Dict[str, Any], previous: Optional[Dict[str, Any]]) -> float:
+    """Momentum score 0-100 using ROC21, ROC63, RSI slope"""
+    roc21 = _safe_get(latest, "roc21", 0.0)
+    roc63 = _safe_get(latest, "roc63", 0.0)
+    rsi = _safe_get(latest, "rsi", None)
+    prev_rsi = _safe_get(previous, "rsi", DEFAULT_PREV_RSI)
+
+    rsi_slope = 0.0
+    if rsi is not None and prev_rsi is not None:
+        rsi_slope = rsi - prev_rsi
+
+    # crude normalization
+    roc_score = max(min((roc63 / 20.0) * 50, 50), -50) + max(min((roc21 / 10.0) * 25, 25), -25)
+    rsi_score = max(min((rsi_slope) * 2.0 * 25, 25), -25)
+
+    raw = 50 + roc_score + rsi_score  # center
+    return max(0.0, min(100.0, raw))
+
+def score_volume(latest: Dict[str, Any], previous: Optional[Dict[str, Any]]) -> float:
+    """Volume score 0-100 using volume shock and OBV/MFI presence"""
+    vol_shock = _safe_get(latest, "volume_shock", 1.0)  # volume / avg30
+    mfi = _safe_get(latest, "mfi", None)
+    obv_slope = _safe_get(latest, "obv_slope", None)
+
+    vol_component = 0.0
+    if vol_shock >= 2.0:
+        vol_component = 50
+    elif vol_shock >= 1.2:
+        vol_component = 30
+    else:
+        vol_component = 10
+
+    mfi_component = 10 if (mfi and mfi > 60) else 0
+    obv_component = 10 if (obv_slope and obv_slope > 0) else 0
+
+    raw = vol_component + mfi_component + obv_component
+    return max(0.0, min(100.0, raw))
+
+def score_volatility(latest: Dict[str, Any], previous: Optional[Dict[str, Any]]) -> float:
+    """Volatility/risk 0-100 - lower volatility preferred for medium term"""
+    bb_width_z = _safe_get(latest, "bb_w_z", 0.0)
+    max_dd = _safe_get(latest, "max_drawdown_90", 0.0)
+
+    # normalize: smaller is better
+    bb_component = max(0.0, min(50.0, 50 - bb_width_z * 10))
+    dd_component = max(0.0, min(50.0, 50 - max_dd * 100))  # if max_dd=0.1 -> 40
+    raw = bb_component + dd_component
+    return max(0.0, min(100.0, raw))
+
+def score_relative_strength(latest: Dict[str, Any], previous: Optional[Dict[str, Any]]) -> float:
+    """Relative strength vs market/sector"""
+    rs_nifty = _safe_get(latest, "rs_nifty", 0.0)  # e.g., 1.05 = +5%
+    sector_strength = _safe_get(latest, "sector_strength", 0.0)
+
+    rs_component = max(min((rs_nifty - 1.0) * 200, 50), -50) + 50  # center at 50
+    sector_component = max(min(sector_strength * 50, 50), -50) + 50
+    raw = (rs_component + sector_component) / 2.0
+    return max(0.0, min(100.0, raw))
+
+def score_fundamental(latest: Dict[str, Any], previous: Optional[Dict[str, Any]]) -> float:
+    """Simple fundamental/event score placeholder"""
+    eps_growth = _safe_get(latest, "eps_ttm_growth", 0.0)
+    insider_buy = _safe_get(latest, "insider_buy", 0.0)  # percentage or boolean
+    promoter_trend = _safe_get(latest, "promoter_trend", 0.0)
+
+    eps_component = max(min(eps_growth * 100.0, 60), -20) + 20
+    insider_component = 10 if insider_buy > 0 else 0
+    promoter_component = max(min(promoter_trend * 20.0, 20), -10) + 10
+
+    raw = eps_component + insider_component + promoter_component
+    return max(0.0, min(100.0, raw))
+
+def compute_medium_term_score(latest: Dict[str, Any], previous: Optional[Dict[str, Any]], fallback_prev_sma_slope: float = DEFAULT_PREV_SMA_SLOPE) -> Dict[str, Any]:
+    """
+    Compute the weighted medium-term score (0-100).
+    latest: latest indicators dict (must exist)
+    previous: previous day's indicators dict or None (safe fallback applied)
+    fallback_prev_sma_slope: used if previous SMA values missing
+    Returns: dict with breakdown and final score
+    """
+    # if previous missing, create a minimal previous placeholder so component functions work
+    if previous is None:
+        previous = {}
+
+    trend = score_trend(latest, previous)
+    momentum = score_momentum(latest, previous)
+    volume = score_volume(latest, previous)
+    volatility = score_volatility(latest, previous)
+    relative_strength = score_relative_strength(latest, previous)
+    fundamental = score_fundamental(latest, previous)
+
+    final = (
+        WEIGHTS["trend"] * trend
+        + WEIGHTS["momentum"] * momentum
+        + WEIGHTS["volume"] * volume
+        + WEIGHTS["volatility"] * volatility
+        + WEIGHTS["relative_strength"] * relative_strength
+        + WEIGHTS["fundamental"] * fundamental
+    )
+
+    return {
+        "score": round(float(final), 2),
+        "components": {
+            "trend": round(trend, 2),
+            "momentum": round(momentum, 2),
+            "volume": round(volume, 2),
+            "volatility": round(volatility, 2),
+            "relative_strength": round(relative_strength, 2),
+            "fundamental": round(fundamental, 2),
+        },
+    }
+
+# # Example quick test
+# if __name__ == "__main__":
+#     latest = {"adx": 30, "close": 120, "sma50": 110, "sma200": 90, "roc21": 3, "roc63": 15, "rsi": 65, "volume_shock": 1.5, "mfi": 62, "bb_w_z": 0.5, "max_drawdown_90": 0.05, "rs_nifty": 1.05, "sector_strength": 0.02, "eps_ttm_growth": 0.15}
+#     previous = {"sma50": 109, "sma200": 89, "rsi": 62}
+#     print(compute_medium_term_score(latest, previous))
+
