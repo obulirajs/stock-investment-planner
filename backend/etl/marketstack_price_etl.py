@@ -7,9 +7,11 @@ from datetime import datetime, timedelta
 from tenacity import retry, stop_after_attempt, wait_fixed
 
 from backend.db import get_database
+from backend.config import MARKETSTACK_KEY
 
 
-MARKETSTACK_API_KEY = os.getenv("MARKETSTACK_API_KEY")
+# MARKETSTACK_API_KEY = os.getenv("MARKETSTACK_API_KEY")
+MARKETSTACK_API_KEY = MARKETSTACK_KEY
 BASE_URL = "http://api.marketstack.com/v1/eod"
 
 CONCURRENCY = 10   # download 10 symbols in parallel
