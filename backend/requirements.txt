@@ -10,3 +10,6 @@ numpy
 pymongo
 uvicorn
 fastapi
+python-dotenv
+pytest
+pytest-asyncio
