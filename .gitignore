@@ -17,7 +17,9 @@ Thumbs.db
 
 # Logs
 *.log
-# Stock_Investment Planner.docx
+Stock_Investment Planner.docx
 Credentials_Reference_Readme.md
 Credentials_Reference_Readme copy.md
-
+Readme.md
+.gitignore
+.env
