@@ -36,5 +36,7 @@ async def fetch_eod(session: aiohttp.ClientSession, symbol: str, limit: int = 10
     async with session.get(url, headers=HEADERS, timeout=60) as resp:
         text = await resp.text()
         if resp.status != 200:
-            raise RuntimeError(f"Marketstack EOD fetch failed: {resp.status} - {text[:300]}")
+            error_msg = f"Marketstack EOD fetch failed: {resp.status} - {text[:500]}"
+            print(f"DEBUG: {error_msg}")
+            raise RuntimeError(error_msg)
         return await resp.json()
