@@ -2,9 +2,7 @@
 
 An end-to-end platform for stock analysis, investment planning, and decision support.
 
-## GitHub Repo Key
-* obulirajs
-* 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  
+
 
 ## 🚀 Features
 
