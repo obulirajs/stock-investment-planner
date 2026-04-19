@@ -1,18 +1,25 @@
-# Feature: API Layer
-
-## 1. Objective
-
-Expose REST APIs for accessing stock data, analysis results, and triggering ETL pipelines.
+# Feature: API Layer (Refined)
 
 ---
 
-## 2. Responsibilities
+## 1. Objective
 
-* Handle HTTP requests
-* Validate input
-* Call service layer
-* Return structured responses
-* Trigger ETL jobs (optional)
+Expose REST APIs for retrieving stock scores, indicators, and price data using existing ETL and scoring modules.
+
+Primary goal: Enable consumption of computed insights (NOT raw ETL orchestration).
+
+---
+
+## 2. Architecture
+
+Follow clean separation:
+
+API Layer -> Service Layer -> Data / Scoring Layer
+
+* API Layer: FastAPI routes
+* Service Layer: orchestrates DB + scoring calls
+* Data Layer: MongoDB
+* Analysis Layer: scoring modules
 
 ---
 
@@ -20,104 +27,181 @@ Expose REST APIs for accessing stock data, analysis results, and triggering ETL 
 
 * FastAPI
 * Async endpoints
+* Uvicorn server
 
 ---
 
-## 4. API Categories
+## 4. Core APIs (Phase 1)
+
+Focus ONLY on read APIs first (NO ETL trigger APIs)
+
+---
 
 ### 4.1 Health Check
 
 **GET /**
-Returns API status
 
----
+Response:
 
-### 4.2 Stock APIs
-
-#### Get Stock Overview
-
-**GET /stocks/{symbol}**
-
-Returns:
-
-* Latest price
-* Analysis (short, medium, long)
-* Indicators
-
----
-
-#### Get Price History
-
-**GET /stocks/{symbol}/prices**
-
-Query params:
-
-* start_date
-* end_date
-
----
-
-#### Get Indicators
-
-**GET /stocks/{symbol}/indicators**
-
----
-
-#### Get Analysis
-
-**GET /stocks/{symbol}/analysis**
-
----
-
-### 4.3 ETL APIs
-
-#### Run Price ETL
-
-**POST /etl/price**
-
-Body:
-
-```json id="g9pyg9"
-["TCS", "INFY"]
+```json
+{
+  "status": "ok"
+}
 ```
 
 ---
 
-#### Run Indicators ETL
+### 4.2 Get Medium-Term Score
 
-**POST /etl/indicators**
+**GET /score/medium/{symbol}**
 
----
+Uses:
 
-#### Run Scoring ETL
+* `backend.analysis.medium_term_scoring`
+* `backend.test_scripts.test_medium_term_scoring` pattern
 
-**POST /etl/scoring**
+Response:
 
----
-
-## 5. Request Validation
-
-* Validate symbol format
-* Validate date ranges
-* Reject invalid inputs
-
----
-
-## 6. Response Format
-
-Standard response:
-
-```json id="89vmlf"
+```json
 {
   "status": "success",
-  "data": {...},
+  "data": {
+    "symbol": "TCS",
+    "score": 78.5,
+    "action": "BUY",
+    "components": {},
+    "explanation": "..."
+  }
+}
+```
+
+---
+
+### 4.3 Get Short-Term Score
+
+**GET /score/short/{symbol}**
+
+Uses:
+
+* `backend.analysis.short_term_scoring`
+
+Response:
+
+```json
+{
+  "status": "success",
+  "data": {
+    "symbol": "TCS",
+    "score": 65.2,
+    "components": {}
+  }
+}
+```
+
+---
+
+### 4.4 Batch Score API
+
+**GET /score/medium**
+
+Query:
+
+```text
+?symbols=TCS,INFY,RELIANCE
+```
+
+Response:
+
+```json
+{
+  "status": "success",
+  "data": [
+    { "symbol": "TCS", "score": 78.5 },
+    { "symbol": "INFY", "score": 72.1 }
+  ]
+}
+```
+
+---
+
+### 4.5 Get Latest Indicators
+
+**GET /indicators/{symbol}**
+
+Returns latest document from:
+
+`technical_indicators` collection
+
+---
+
+### 4.6 Get Price History
+
+**GET /prices/{symbol}**
+
+Query params:
+
+* `start_date` (optional)
+* `end_date` (optional)
+
+Returns data from:
+
+`daily_price_data` collection
+
+---
+
+## 5. Service Layer (IMPORTANT)
+
+Create new module:
+
+`backend/services/stock_service.py`
+
+Responsibilities:
+
+* Fetch latest indicators
+* Fetch previous indicators (for scoring)
+* Call scoring functions
+* Format response
+
+---
+
+## 6. Async vs Sync Handling (CRITICAL)
+
+Mongo (`pymongo`) is synchronous.
+
+Therefore:
+
+* API = async
+* DB calls = sync (wrapped safely)
+
+Use:
+
+```python
+from fastapi.concurrency import run_in_threadpool
+```
+
+Example:
+
+```python
+latest = await run_in_threadpool(get_latest_indicator, symbol)
+```
+
+---
+
+## 7. Response Format
+
+Standard:
+
+```json
+{
+  "status": "success",
+  "data": {},
   "error": null
 }
 ```
 
-Error response:
+Error:
 
-```json id="2w5q4n"
+```json
 {
   "status": "error",
   "data": null,
@@ -127,48 +211,58 @@ Error response:
 
 ---
 
-## 7. Error Handling
+## 8. Validation
 
-* 400 → Bad request
-* 404 → Not found
-* 500 → Internal error
-
----
-
-## 8. Dependencies
-
-* Stock Service Layer
-* ETL modules
-* Database layer
+* Symbol must be uppercase string
+* `symbols` query param must be comma-separated
+* Validate date format (`YYYY-MM-DD`)
 
 ---
 
-## 9. Performance Considerations
+## 9. Error Handling
 
-* Async endpoints
-* Avoid blocking operations
-* Use background tasks for ETL
+* 400 -> Invalid input
+* 404 -> Symbol not found
+* 500 -> Internal error
 
 ---
 
-## 10. Security (Future)
+## 10. Performance Considerations
 
-* API authentication (JWT)
+* Use async endpoints
+* Avoid blocking calls directly
+* Use threadpool for DB + scoring
+
+---
+
+## 11. Out of Scope (Phase 1)
+
+DO NOT implement now:
+
+* ETL trigger APIs
+* Authentication
 * Rate limiting
-* Input sanitization
-
----
-
-## 11. Documentation
-
-* Swagger UI (`/docs`)
-* OpenAPI specification
+* WebSockets
 
 ---
 
 ## 12. Future Enhancements
 
-* GraphQL support
-* WebSocket streaming (live prices)
-* Batch APIs
-* API versioning (`/v1`, `/v2`)
+* Add long-term scoring
+* Add caching (Redis)
+* Add batch APIs for indicators
+* Add portfolio-level scoring
+* Add UI integration
+
+---
+
+## 13. Deliverables
+
+* FastAPI app (`backend/api/main.py`)
+* Routes module (`backend/api/routes/`)
+* Service layer (`backend/services/`)
+* Fully working endpoints for:
+* `/score/medium/{symbol}`
+* `/score/short/{symbol}`
+* `/indicators/{symbol}`
+* `/prices/{symbol}`
