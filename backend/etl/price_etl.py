@@ -4,17 +4,26 @@ import aiohttp
 from backend.api_clients.marketstack_client import fetch_eod
 from pymongo import MongoClient, UpdateOne
 from backend.config import MONGO_URL, DB_NAME
+from backend.etl.adapters.marketstack_adapter import MarketStackAdapter
 
 CONCURRENCY = 4
+DEFAULT_PROVIDER = "marketstack"
 
 def get_database_sync():
     """Get synchronous MongoDB connection"""
     client = MongoClient(MONGO_URL, connect=False)
     return client[DB_NAME]
 
+
+def get_price_adapter(provider: str = DEFAULT_PROVIDER):
+    if provider == "marketstack":
+        return MarketStackAdapter()
+    raise ValueError("Unsupported provider")
+
 async def fetch_and_save_eod_for_symbol(session, symbol):
     """Fetch data and return it (write will be done separately)"""
     try:
+        adapter = get_price_adapter()
         resp = await fetch_eod(session, symbol + ".XNSE", limit=1000, offset=0)
         if not resp or "data" not in resp:
             return False, symbol, None
@@ -22,16 +31,10 @@ async def fetch_and_save_eod_for_symbol(session, symbol):
         # Prepare bulk operations
         operations = []
         for r in resp["data"]:
-            doc = {
-                "symbol": symbol,
-                "date": r.get("date"),
-                "open": r.get("open"),
-                "high": r.get("high"),
-                "low": r.get("low"),
-                "close": r.get("close"),
-                "volume": r.get("volume"),
-                "adj_close": r.get("adj_close") if "adj_close" in r else r.get("adjusted_close")
-            }
+            doc = adapter.transform(r, symbol)
+
+            if doc.get("symbol") is None or doc.get("date") is None or doc.get("close") is None:
+                continue
 
             operations.append(
                 UpdateOne(

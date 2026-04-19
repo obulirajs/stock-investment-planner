@@ -29,6 +29,10 @@ etl/         # data pipelines
 020–029 → Services
 030–039 → Infra
  ```
+
+
+## Run a Test case/file:
+pytest backend/tests/test_medium_term_scoring.py -v
  
 
 ## ⚙️ Setup

@@ -2,6 +2,7 @@
 # Pure scoring logic for medium-term (0-100). No DB access here.
 from typing import Optional, Dict, Any
 from math import isfinite
+from datetime import datetime, timezone
 
 # Weights (simple, explainable)
 WEIGHTS = {
@@ -54,20 +55,20 @@ def score_trend_slope(latest: Dict[str, Any], prev: Optional[Dict[str, Any]]) ->
     s_prev = _safe_get(prev, "sma200")
     if s_today is None or s_prev is None:
         return 0.5
-    slope_pct = (s_today - s_prev) / (s_prev + 1e-9)
-    # expect small percentages; clip -0.05..0.05
-    return _norm_clip(slope_pct, -0.05, 0.05)
+    slope_pct = ((s_today - s_prev) / (s_prev + 1e-9)) * 100  # Convert to % per spec
+    # spec range: [-5%, +5%]
+    return _norm_clip(slope_pct, -5.0, 5.0)
 
 def score_momentum(latest: Dict[str, Any]) -> float:
-    # use roc63 if present, else roc21 else momentum_20
+    # use roc63 if present, else roc21 else momentum_20 (input already in %)
     roc63 = _safe_get(latest, "roc63")
     roc21 = _safe_get(latest, "roc21")
     mom = _safe_get(latest, "momentum_20") or _safe_get(latest, "momentum100")
     val = roc63 if roc63 is not None else (roc21 if roc21 is not None else mom)
     if val is None:
         return 0.5
-    # map -30%..+30% to 0..1 (very wide)
-    return _norm_clip(val/100.0, -0.30, 0.30)
+    # spec range: [-20%, +20%] (input already in %)
+    return _norm_clip(val, -20.0, 20.0)
 
 def score_52week(latest: Dict[str, Any]) -> float:
     # position in 52-week range: 0..1
@@ -79,11 +80,75 @@ def score_52week(latest: Dict[str, Any]) -> float:
     pos = (close - low) / (high - low)
     return max(0.0, min(1.0, pos))
 
-def compute_medium_term_score(latest: Dict[str, Any], previous: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+def _get_action(score_int: int) -> str:
+    """Determine action based on integer score (deterministic thresholds)"""
+    if score_int >= 65:
+        return "BUY"
+    elif score_int >= 45:
+        return "WATCH"
+    else:
+        return "AVOID"
+
+def _generate_explanation(components: Dict[str, float], score: float, action: str) -> str:
+    """Generate human-readable explanation based on components"""
+    trend_h = components["trend_health"]
+    long_t = components["long_trend"]
+    slope = components["trend_slope"]
+    mom = components["momentum"]
+    week52 = components["week52_strength"]
+    
+    explanation = f"Score: {score:.0f} ({action}). "
+    
+    # Trend health
+    if trend_h >= 80:
+        explanation += "Close significantly above SMA50 (strong short-term). "
+    elif trend_h >= 60:
+        explanation += "Close above SMA50 (uptrend). "
+    elif trend_h <= 20:
+        explanation += "Close below SMA50 (downtrend). "
+    else:
+        explanation += "Close near SMA50 (neutral short-term). "
+    
+    # Long trend
+    if long_t >= 80:
+        explanation += "SMA50 well above SMA200 (strong intermediate uptrend). "
+    elif long_t >= 60:
+        explanation += "SMA50 above SMA200 (uptrend). "
+    elif long_t <= 20:
+        explanation += "SMA50 below SMA200 (downtrend). "
+    
+    # Momentum
+    if mom >= 70:
+        explanation += f"Strong positive momentum. "
+    elif mom <= 30:
+        explanation += f"Weak or negative momentum. "
+    
+    # 52-week positioning
+    if week52 >= 80:
+        explanation += "Trading near 52-week highs (bullish)."
+    elif week52 <= 20:
+        explanation += "Trading near 52-week lows (bearish)."
+    
+    return explanation
+
+def compute_medium_term_score(latest: Dict[str, Any], previous: Optional[Dict[str, Any]] = None, symbol: str = "") -> Dict[str, Any]:
     """
-    Returns: { score: float (0-100), components: {..} }
-    latest: flattened indicators dict (close, sma50, sma200, roc21/63, etc.)
-    previous: flattened indicators dict (for prev sma200)
+    Compute medium-term investment score (0-100) with action recommendation.
+    
+    Args:
+        latest: flattened indicators dict (close, sma50, sma200, roc21/63, momentum_20, 52w_high, 52w_low)
+        previous: flattened indicators dict (for prev sma200, required for trend_slope)
+        symbol: stock symbol (optional, for output)
+    
+    Returns: {
+        score: float (0-100, 2 decimals),
+        score_int: int (0-100, for thresholds),
+        action: str (BUY, WATCH, AVOID),
+        components: dict of component scores [0, 100],
+        explanation: str (human-readable),
+        computed_at: str (ISO 8601 UTC timestamp),
+        symbol: str (if provided)
+    }
     """
     # components in 0..1
     c_trend_health = score_trend_health(latest)
@@ -93,11 +158,11 @@ def compute_medium_term_score(latest: Dict[str, Any], previous: Optional[Dict[st
     c_week52 = score_52week(latest)
 
     comp_map = {
-        "trend_health": round(c_trend_health * 100, 2),
-        "long_trend": round(c_long_trend * 100, 2),
-        "trend_slope": round(c_trend_slope * 100, 2),
-        "momentum": round(c_momentum * 100, 2),
-        "week52_strength": round(c_week52 * 100, 2),
+        "trend_health": round(c_trend_health * 100, 1),
+        "long_trend": round(c_long_trend * 100, 1),
+        "trend_slope": round(c_trend_slope * 100, 1),
+        "momentum": round(c_momentum * 100, 1),
+        "week52_strength": round(c_week52 * 100, 1),
     }
 
     final = (
@@ -109,5 +174,20 @@ def compute_medium_term_score(latest: Dict[str, Any], previous: Optional[Dict[st
     )
 
     score_0_100 = round(max(0.0, min(100.0, final * 100)), 2)
+    score_int = int(score_0_100)  # Floor for deterministic thresholds
+    action = _get_action(score_int)
+    explanation = _generate_explanation(comp_map, score_0_100, action)
 
-    return {"score": score_0_100, "components": comp_map}
+    result = {
+        "score": score_0_100,
+        "score_int": score_int,
+        "action": action,
+        "components": comp_map,
+        "explanation": explanation,
+        "computed_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+    }
+    
+    if symbol:
+        result["symbol"] = symbol
+    
+    return result

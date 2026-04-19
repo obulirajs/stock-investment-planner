@@ -147,8 +147,14 @@ def compute_symbol(args: Tuple[str, bool]):
         last_date = get_last_indicator_date(symbol) if incremental else None
         start = last_date - pd.Timedelta(days=LOOKBACK_DAYS) if last_date else None
         df = fetch_price_df_sync(symbol, start)
-        if df.empty or len(df) < 30:
-            return symbol, False, "Not enough data"
+        # if df.empty or len(df) < 30:
+        #     return symbol, False, "Not enough data"
+
+        if df.empty:
+            return symbol, False, "No data"
+
+        if len(df) < 30:
+            return symbol, True, "Skipped (insufficient data)"
 
         c, h, l, v = df["close"], df["high"], df["low"], df["volume"]
         ind = pd.DataFrame(index=df.index)
@@ -210,6 +216,12 @@ def run_indicators_etl_sync(incremental: bool = True):
             ok = sum(1 for r in results if r[1])
             fail = len(results) - ok
             print(f"Progress: {len(results)}/{len(symbols)} (ok={ok}, failed={fail})")
+
+    #added code to identify failed symbols and print them out
+    failed_symbols = [r for r in results if not r[1]]
+    print("\nFailed symbols:")
+    for f in failed_symbols[:10]:
+        print(f)
 
     print("\nCompleted.")
     return results
